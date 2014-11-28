@@ -50,8 +50,8 @@ class Chassis(base.APIBase):
     description = wtypes.text
     "The description of the chassis"
 
-    extra = {wtypes.text: types.MultiType(wtypes.text, six.integer_types)}
-    "The metadata of the chassis"
+    extra = {wtypes.text: types.jsontype}
+    """The metadata of the chassis"""
 
     links = wsme.wsattr([link.Link], readonly=True)
     "A list containing a self link and associated chassis links"
