@@ -17,3 +17,4 @@ dd: CommandFilter, dd, root
 # ironic/common/disk_partitioner.py
 fuser: CommandFilter, fuser, root
 parted: CommandFilter, parted, root
+partprobe: CommandFilter, partprobe, root

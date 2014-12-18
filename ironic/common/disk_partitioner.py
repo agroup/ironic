@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import glob
 import re
 
 from oslo.config import cfg
@@ -47,6 +48,15 @@ CONF.register_group(opt_group)
 CONF.register_opts(opts, opt_group)
 
 LOG = logging.getLogger(__name__)
+
+
+def _list_devfs(device):
+    """List the partitions of a given device in devfs.
+
+    :param device: the device name.
+
+    """
+    return glob.glob(device + '?*')
 
 
 class DiskPartitioner(object):
@@ -120,18 +130,31 @@ class DiskPartitioner(object):
             #                the specified files is accessed
             out, err = utils.execute('fuser', self._device,
                                      check_exit_code=[0, 1], run_as_root=True)
-
-            if not out and not err:
-                raise loopingcall.LoopingCallDone()
-            else:
+            if out or err:
                 if err:
                     stderr[0] = err
                 if out:
                     pids_match = re.search(self._fuser_pids_re, out)
                     pids[0] = pids_match.group()
+
+                # Something went bad, return to continue the interaction
+                return
+
+            # Device is now available and no processes are accessing it,
+            # let's tell the kernel to re-read the partition table to make
+            # sure the partitions are also available
+            utils.execute('partprobe', self._device, check_exit_code=[0],
+                          run_as_root=True)
+
+            # No errors from fuser nor partprobe, the device and it's
+            # partitions should be available for use by now
+            if len(_list_devfs(self._device)) > 0:
+                raise loopingcall.LoopingCallDone()
+
         except processutils.ProcessExecutionError as exc:
-            LOG.warning(_LW('Failed to check the device %(device)s with fuser:'
-                            ' %(err)s'), {'device': self._device, 'err': exc})
+            LOG.warning(_LW('Failed to check if the device %(device)s is now '
+                            'ready for use: %(err)s'), {'device': self._device,
+                                                        'err': exc})
 
     def commit(self):
         """Write to the disk."""

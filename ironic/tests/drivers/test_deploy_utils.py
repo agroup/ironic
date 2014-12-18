@@ -573,6 +573,7 @@ class WorkOnDiskTestCase(tests_base.TestCase):
                                              commit=True)
 
 
+@mock.patch.object(disk_partitioner, '_list_devfs')
 @mock.patch.object(common_utils, 'execute')
 class MakePartitionsTestCase(tests_base.TestCase):
 
@@ -585,7 +586,8 @@ class MakePartitionsTestCase(tests_base.TestCase):
         self.parted_static_cmd = ['parted', '-a', 'optimal', '-s', self.dev,
                                   '--', 'unit', 'MiB', 'mklabel', 'msdos']
 
-    def test_make_partitions(self, mock_exc):
+    def test_make_partitions(self, mock_exc, mock_list_devfs):
+        mock_list_devfs.return_value = ['/dev/fake1', '/dev/fake2']
         mock_exc.return_value = (None, None)
         utils.make_partitions(self.dev, self.root_mb, self.swap_mb,
                               self.ephemeral_mb)
@@ -599,8 +601,10 @@ class MakePartitionsTestCase(tests_base.TestCase):
         fuser_call = mock.call(*fuser_cmd, run_as_root=True,
                                check_exit_code=[0, 1])
         mock_exc.assert_has_calls([parted_call, fuser_call])
+        mock_list_devfs.assert_called_once_with(self.dev)
 
-    def test_make_partitions_with_ephemeral(self, mock_exc):
+    def test_make_partitions_with_ephemeral(self, mock_exc, mock_list_devfs):
+        mock_list_devfs.return_value = ['/dev/fake1', '/dev/fake2']
         self.ephemeral_mb = 2048
         expected_mkpart = ['mkpart', 'primary', '', '1', '2049',
                            'mkpart', 'primary', 'linux-swap', '2049', '2561',
@@ -612,6 +616,7 @@ class MakePartitionsTestCase(tests_base.TestCase):
 
         parted_call = mock.call(*cmd, run_as_root=True, check_exit_code=[0])
         mock_exc.assert_has_calls(parted_call)
+        mock_list_devfs.assert_called_once_with(self.dev)
 
 
 @mock.patch.object(utils, 'get_dev_block_size')
@@ -678,6 +683,31 @@ class GetDeviceBlockSizeTestCase(tests_base.TestCase):
         mock_exec.assert_has_calls(expected_call)
 
 
+@mock.patch.object(utils, 'dd')
+@mock.patch.object(images, 'qemu_img_info')
+@mock.patch.object(images, 'convert_image')
+class PopulateImageTestCase(tests_base.TestCase):
+
+    def setUp(self):
+        super(PopulateImageTestCase, self).setUp()
+
+    def test_populate_raw_image(self, mock_cg, mock_qinfo, mock_dd):
+        type(mock_qinfo.return_value).file_format = mock.PropertyMock(
+            return_value='raw')
+        utils.populate_image('src', 'dst')
+        mock_dd.assert_called_once_with('src', 'dst')
+        self.assertFalse(mock_cg.called)
+
+    def test_populate_qcow2_image(self, mock_cg, mock_qinfo, mock_dd):
+        type(mock_qinfo.return_value).file_format = mock.PropertyMock(
+            return_value='qcow2')
+        utils.populate_image('src', 'dst')
+        mock_cg.assert_called_once_with('src', 'dst', 'raw', True)
+        self.assertFalse(mock_dd.called)
+
+
+@mock.patch.object(disk_partitioner,
+                   '_list_devfs', lambda d: ['/dev/fake1', '/dev/fake2'])
 @mock.patch.object(utils, 'is_block_device', lambda d: True)
 @mock.patch.object(utils, 'block_uuid', lambda p: 'uuid')
 @mock.patch.object(utils, 'dd', lambda *_: None)
