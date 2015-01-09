@@ -22,6 +22,7 @@ import shutil
 
 from oslo.config import cfg
 
+from ironic.common import boot_devices
 from ironic.common import dhcp_factory
 from ironic.common import exception
 from ironic.common.i18n import _
@@ -176,11 +177,13 @@ def _build_pxe_config_options(node, pxe_info, ctx):
         'aki_path': kernel,
         'ari_path': ramdisk,
         'pxe_append_params': CONF.pxe.pxe_append_params,
-        'tftp_server': CONF.pxe.tftp_server
+        'tftp_server': CONF.pxe.tftp_server,
+        'localboot': node.instance_info.get('localboot'),
     }
 
     deploy_ramdisk_options = iscsi_deploy.build_deploy_ramdisk_options(node)
     pxe_options.update(deploy_ramdisk_options)
+
     return pxe_options
 
 
@@ -418,6 +421,13 @@ class PXEDeploy(base.DeployInterface):
         provider = dhcp_factory.DHCPFactory()
         provider.update_dhcp(task, dhcp_opts)
 
+        if task.node.instance_info.get('localboot'):
+            # If it's going to boot from the local disk, we don't need
+            # PXE config files. They still need to be generated as part
+            # of the prepare() because the deployment does PXE boot the
+            # deploy ramdisk
+            pxe_utils.clean_up_pxe_config(task)
+
 
 class VendorPassthru(base.VendorInterface):
     """Interface to mix IPMI and PXE vendor-specific interfaces."""
@@ -468,13 +478,34 @@ class VendorPassthru(base.VendorInterface):
         if not root_uuid:
             return
 
-        try:
+        # NOTE(faizan): Under UEFI boot mode, setting of boot device may differ
+        # between different machines. IPMI does not work for setting boot
+        # devices in UEFI mode for certain machines.
+        # Expected IPMI failure for uefi boot mode. Logging a message to
+        # set the boot device manually and continue with deploy.
+        if node.instance_info.get('localboot'):
+            try:
+                manager_utils.node_set_boot_device(task, boot_devices.DISK,
+                                                   persistent=True)
+            except exception.IPMIFailure:
+                if driver_utils.get_node_capability(node,
+                                                    'boot_mode') == 'uefi':
+                    LOG.warning(_LW("ipmitool is unable to set boot device "
+                                    "while the node is in UEFI boot mode."
+                                    "Please set the boot device manually."))
+                else:
+                    raise
+
+            # If it's going to boot from the local disk, get rid of
+            # the PXE configuration files used for the deployment
+            pxe_utils.clean_up_pxe_config(task)
+        else:
             pxe_config_path = pxe_utils.get_pxe_config_file_path(node.uuid)
             deploy_utils.switch_pxe_config(pxe_config_path, root_uuid,
-                          driver_utils.get_node_capability(node, 'boot_mode'))
+                driver_utils.get_node_capability(node, 'boot_mode'))
 
+        try:
             deploy_utils.notify_deploy_complete(kwargs['address'])
-
             LOG.info(_LI('Deployment to node %s done'), node.uuid)
             node.provision_state = states.ACTIVE
             node.target_provision_state = states.NOSTATE
