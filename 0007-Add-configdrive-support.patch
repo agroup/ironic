@@ -1,0 +1,664 @@
+commit 7b5501bfb31a0694e65d31840d19e252c9288873
+Author: Lucas Alvares Gomes <lucasagomes@gmail.com>
+Date:   Mon Dec 22 16:34:58 2014 +0000
+
+    PXE: Add configdrive support
+    
+    This patch adds supports for creating a configdrive partition for the PXE
+    drivers. When the 'configdrive' parameter is set on node.instance_info,
+    the code will then create a partition of the size of the uncompressed
+    configdrive and byte copy the configdrive onto the new partition.
+    
+    Implements: blueprint expose-configdrive
+    Change-Id: I012e4bb8fdf4a00166f1fedae79d40449a2613ea
+    
+    Conflicts:
+    	ironic/drivers/modules/deploy_utils.py
+    	ironic/tests/drivers/test_deploy_utils.py
+
+diff --git a/ironic/common/utils.py b/ironic/common/utils.py
+index 4c6443f..96e584b 100644
+--- a/ironic/common/utils.py
++++ b/ironic/common/utils.py
+@@ -541,3 +541,8 @@ def dd(src, dst, *args):
+     """
+     execute('dd', 'if=%s' % src, 'of=%s' % dst, *args,
+             run_as_root=True, check_exit_code=[0])
++
++
++def is_http_url(url):
++    url = url.lower()
++    return url.startswith('http://') or url.startswith('https://')
+diff --git a/ironic/drivers/modules/deploy_utils.py b/ironic/drivers/modules/deploy_utils.py
+index 8901fe1..f10dce8 100644
+--- a/ironic/drivers/modules/deploy_utils.py
++++ b/ironic/drivers/modules/deploy_utils.py
+@@ -14,14 +14,22 @@
+ #    under the License.
+ 
+ 
++import base64
++import gzip
++import math
+ import os
+ import re
++import shutil
+ import socket
+ import stat
++import tempfile
+ import time
+ 
+ from oslo.config import cfg
+ from oslo.utils import excutils
++from oslo.utils import units
++import requests
++import six
+ 
+ from ironic.common import disk_partitioner
+ from ironic.common import exception
+@@ -96,14 +104,20 @@ def delete_iscsi(portal_address, portal_port, target_iqn):
+                   delay_on_retry=True)
+ 
+ 
+-def make_partitions(dev, root_mb, swap_mb, ephemeral_mb, commit=True):
+-    """Create partitions for root, swap and ephemeral on a disk device.
++def make_partitions(dev, root_mb, swap_mb, ephemeral_mb,
++                    configdrive_mb, commit=True):
++    """Partition the disk device.
++
++    Create partitions for root, swap, ephemeral and configdrive on a
++    disk device.
+ 
+     :param root_mb: Size of the root partition in mebibytes (MiB).
+     :param swap_mb: Size of the swap partition in mebibytes (MiB). If 0,
+-        no swap partition will be created.
++        no partition will be created.
+     :param ephemeral_mb: Size of the ephemeral partition in mebibytes (MiB).
+-        If 0, no ephemeral partition will be created.
++        If 0, no partition will be created.
++    :param configdrive_mb: Size of the configdrive partition in
++        mebibytes (MiB). If 0, no partition will be created.
+     :param commit: True/False. Default for this setting is True. If False
+         partitions will not be written to disk.
+     :returns: A dictionary containing the partition type as Key and partition
+@@ -121,6 +135,10 @@ def make_partitions(dev, root_mb, swap_mb, ephemeral_mb, commit=True):
+         part_num = dp.add_partition(swap_mb, fs_type='linux-swap')
+         part_dict['swap'] = part_template % part_num
+ 
++    if configdrive_mb:
++        part_num = dp.add_partition(configdrive_mb)
++        part_dict['configdrive'] = part_template % part_num
++
+     # NOTE(lucasagomes): Make the root partition the last partition. This
+     # enables tools like cloud-init's growroot utility to expand the root
+     # partition until the end of the disk.
+@@ -266,8 +284,67 @@ def destroy_disk_metadata(dev, node_uuid):
+                            'error': err.stderr})
+ 
+ 
++def _get_configdrive(configdrive, node_uuid):
++    """Get the information about size and location of the configdrive.
++
++    :param configdrive: Base64 encoded Gzipped configdrive content or
++        configdrive HTTP URL.
++    :param node_uuid: Node's uuid. Used for logging.
++    :raises: InstanceDeployFailure if it can't download or decode the
++       config drive.
++    :returns: A tuple with the size in MiB and path to the uncompressed
++        configdrive file.
++
++    """
++    # Check if the configdrive option is a HTTP URL or the content directly
++    is_url = utils.is_http_url(configdrive)
++    if is_url:
++        try:
++            data = requests.get(configdrive).content
++        except requests.exceptions.RequestException as e:
++            raise exception.InstanceDeployFailure(
++                _("Can't download the configdrive content for node %(node)s "
++                  "from '%(url)s'. Reason: %(reason)s") %
++                {'node': node_uuid, 'url': configdrive, 'reason': e})
++    else:
++        data = configdrive
++
++    try:
++        data = six.StringIO(base64.b64decode(data))
++    except TypeError:
++        error_msg = (_('Config drive for node %s is not base64 encoded '
++                       'or the content is malformed.') % node_uuid)
++        if is_url:
++            error_msg += _(' Downloaded from "%s".') % configdrive
++        raise exception.InstanceDeployFailure(error_msg)
++
++    configdrive_file = tempfile.NamedTemporaryFile(delete=False,
++                                                   prefix='configdrive')
++    configdrive_mb = 0
++    with gzip.GzipFile('configdrive', 'rb', fileobj=data) as gunzipped:
++        try:
++            shutil.copyfileobj(gunzipped, configdrive_file)
++        except EnvironmentError as e:
++            # Delete the created file
++            utils.unlink_without_raise(configdrive_file.name)
++            raise exception.InstanceDeployFailure(
++                _('Encountered error while decompressing and writing '
++                  'config drive for node %(node)s. Error: %(exc)s') %
++                {'node': node_uuid, 'exc': e})
++        else:
++            # Get the file size and convert to MiB
++            configdrive_file.seek(0, os.SEEK_END)
++            bytes_ = configdrive_file.tell()
++            configdrive_mb = int(math.ceil(float(bytes_) / units.Mi))
++        finally:
++            configdrive_file.close()
++
++        return (configdrive_mb, configdrive_file.name)
++
++
+ def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, ephemeral_format,
+-                 image_path, node_uuid, preserve_ephemeral=False):
++                 image_path, node_uuid, preserve_ephemeral=False,
++                 configdrive=None):
+     """Create partitions and copy an image to the root partition.
+ 
+     :param dev: Path for the device to work on.
+@@ -282,11 +359,13 @@ def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, ephemeral_format,
+     :param preserve_ephemeral: If True, no filesystem is written to the
+         ephemeral block device, preserving whatever content it had (if the
+         partition table has not changed).
++    :param configdrive: Optional. Base64 encoded Gzipped configdrive content
++                        or configdrive HTTP URL.
+     :returns: the UUID of the root partition.
+     """
+     if not is_block_device(dev):
+-        raise exception.InstanceDeployFailure(_("Parent device '%s' not found")
+-                                              % dev)
++        raise exception.InstanceDeployFailure(
++            _("Parent device '%s' not found") % dev)
+ 
+     # the only way for preserve_ephemeral to be set to true is if we are
+     # rebuilding an instance with --preserve_ephemeral.
+@@ -294,22 +373,44 @@ def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, ephemeral_format,
+     # now if we are committing the changes to disk clean first.
+     if commit:
+         destroy_disk_metadata(dev, node_uuid)
+-    part_dict = make_partitions(dev, root_mb, swap_mb, ephemeral_mb,
+-                                commit=commit)
+-
+-    ephemeral_part = part_dict.get('ephemeral')
+-    swap_part = part_dict.get('swap')
+-    root_part = part_dict.get('root')
+-
+-    if not is_block_device(root_part):
+-        raise exception.InstanceDeployFailure(_("Root device '%s' not found")
+-                                              % root_part)
+-    if swap_part and not is_block_device(swap_part):
+-        raise exception.InstanceDeployFailure(_("Swap device '%s' not found")
+-                                              % swap_part)
+-    if ephemeral_part and not is_block_device(ephemeral_part):
+-        raise exception.InstanceDeployFailure(
+-                         _("Ephemeral device '%s' not found") % ephemeral_part)
++
++    try:
++        # If requested, get the configdrive file and determine the size
++        # of the configdrive partition
++        configdrive_mb = 0
++        configdrive_file = None
++        if configdrive:
++            configdrive_mb, configdrive_file = _get_configdrive(configdrive,
++                                                                node_uuid)
++
++        part_dict = make_partitions(dev, root_mb, swap_mb, ephemeral_mb,
++                                    configdrive_mb, commit=commit)
++
++        ephemeral_part = part_dict.get('ephemeral')
++        swap_part = part_dict.get('swap')
++        configdrive_part = part_dict.get('configdrive')
++        root_part = part_dict.get('root')
++
++        if not is_block_device(root_part):
++            raise exception.InstanceDeployFailure(
++                _("Root device '%s' not found") % root_part)
++
++        for part in ('swap', 'ephemeral', 'configdrive'):
++            part_device = part_dict.get(part)
++            if part_device and not is_block_device(part_device):
++                raise exception.InstanceDeployFailure(
++                    _("'%(partition)s' device '%(part_device)s' not found") %
++                    {'partition': part, 'part_device': part_device})
++
++        if configdrive_part:
++            # Copy the configdrive content to the configdrive partition
++            dd(configdrive_file, configdrive_part)
++
++    finally:
++        # If the configdrive was requested make sure we delete the file
++        # after copying the content to the partition
++        if configdrive_file:
++            utils.unlink_without_raise(configdrive_file)
+ 
+     dd(image_path, root_part)
+ 
+@@ -324,12 +425,13 @@ def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, ephemeral_format,
+     except processutils.ProcessExecutionError:
+         with excutils.save_and_reraise_exception():
+             LOG.error(_LE("Failed to detect root device UUID."))
++
+     return root_uuid
+ 
+ 
+ def deploy(address, port, iqn, lun, image_path,
+            root_mb, swap_mb, ephemeral_mb, ephemeral_format, node_uuid,
+-           preserve_ephemeral=False):
++           preserve_ephemeral=False, configdrive=None):
+     """All-in-one function to deploy a node.
+ 
+     :param address: The iSCSI IP address.
+@@ -347,6 +449,8 @@ def deploy(address, port, iqn, lun, image_path,
+     :param preserve_ephemeral: If True, no filesystem is written to the
+         ephemeral block device, preserving whatever content it had (if the
+         partition table has not changed).
++    :param configdrive: Optional. Base64 encoded Gzipped configdrive content
++                        or configdrive HTTP URL.
+     :returns: the UUID of the root partition.
+     """
+     dev = get_dev(address, port, iqn, lun)
+@@ -358,7 +462,8 @@ def deploy(address, port, iqn, lun, image_path,
+     try:
+         root_uuid = work_on_disk(dev, root_mb, swap_mb, ephemeral_mb,
+                                  ephemeral_format, image_path, node_uuid,
+-                                 preserve_ephemeral)
++                                 preserve_ephemeral=preserve_ephemeral,
++                                 configdrive=configdrive)
+     except processutils.ProcessExecutionError as err:
+         with excutils.save_and_reraise_exception():
+             LOG.error(_LE("Deploy to address %s failed."), address)
+diff --git a/ironic/drivers/modules/iscsi_deploy.py b/ironic/drivers/modules/iscsi_deploy.py
+index 269e9d9..aee30b0 100644
+--- a/ironic/drivers/modules/iscsi_deploy.py
++++ b/ironic/drivers/modules/iscsi_deploy.py
+@@ -127,6 +127,7 @@ def parse_instance_info(node):
+     i_info['swap_mb'] = info.get('swap_mb', 0)
+     i_info['ephemeral_gb'] = info.get('ephemeral_gb', 0)
+     i_info['ephemeral_format'] = info.get('ephemeral_format')
++    i_info['configdrive'] = info.get('configdrive')
+ 
+     err_msg_invalid = _("Cannot validate parameter for iSCSI deploy. "
+                         "Invalid parameter %(param)s. Reason: %(reason)s")
+@@ -238,8 +239,9 @@ def get_deploy_info(node, **kwargs):
+                 "Parameters %s were not passed to ironic"
+                 " for deploy.") % missing)
+ 
+-    # ephemeral_format is nullable
++    # configdrive and ephemeral_format are nullable
+     params['ephemeral_format'] = i_info.get('ephemeral_format')
++    params['configdrive'] = i_info.get('configdrive')
+ 
+     return params
+ 
+diff --git a/ironic/tests/drivers/test_deploy_utils.py b/ironic/tests/drivers/test_deploy_utils.py
+index 4de64ba..0ee58f2 100644
+--- a/ironic/tests/drivers/test_deploy_utils.py
++++ b/ironic/tests/drivers/test_deploy_utils.py
+@@ -16,10 +16,15 @@
+ 
+ import fixtures
+ import mock
++import base64
++import gzip
+ import os
++import shutil
+ import tempfile
+ 
+ from oslo.config import cfg
++from oslo_concurrency import processutils
++import requests
+ 
+ from ironic.common import disk_partitioner
+ from ironic.common import exception
+@@ -121,6 +126,7 @@ image=kernel
+ 
+ 
+ class PhysicalWorkTestCase(tests_base.TestCase):
++
+     def setUp(self):
+         super(PhysicalWorkTestCase, self).setUp()
+ 
+@@ -151,6 +157,7 @@ class PhysicalWorkTestCase(tests_base.TestCase):
+         swap_mb = 64
+         ephemeral_mb = 0
+         ephemeral_format = None
++        configdrive_mb = 0
+         node_uuid = "12345678-1234-1234-1234-1234567890abcxyz"
+ 
+         dev = '/dev/fake'
+@@ -177,6 +184,7 @@ class PhysicalWorkTestCase(tests_base.TestCase):
+                           mock.call.destroy_disk_metadata(dev, node_uuid),
+                           mock.call.make_partitions(dev, root_mb, swap_mb,
+                                                     ephemeral_mb,
++                                                    configdrive_mb,
+                                                     commit=True),
+                           mock.call.is_block_device(root_part),
+                           mock.call.is_block_device(swap_part),
+@@ -205,6 +213,7 @@ class PhysicalWorkTestCase(tests_base.TestCase):
+         swap_mb = 0
+         ephemeral_mb = 0
+         ephemeral_format = None
++        configdrive_mb = 0
+         node_uuid = "12345678-1234-1234-1234-1234567890abcxyz"
+ 
+         dev = '/dev/fake'
+@@ -229,6 +238,7 @@ class PhysicalWorkTestCase(tests_base.TestCase):
+                           mock.call.destroy_disk_metadata(dev, node_uuid),
+                           mock.call.make_partitions(dev, root_mb, swap_mb,
+                                                     ephemeral_mb,
++                                                    configdrive_mb,
+                                                     commit=True),
+                           mock.call.is_block_device(root_part),
+                           mock.call.dd(image_path, root_part),
+@@ -254,6 +264,7 @@ class PhysicalWorkTestCase(tests_base.TestCase):
+         root_mb = 128
+         swap_mb = 64
+         ephemeral_mb = 256
++        configdrive_mb = 0
+         ephemeral_format = 'exttest'
+         node_uuid = "12345678-1234-1234-1234-1234567890abcxyz"
+ 
+@@ -284,6 +295,7 @@ class PhysicalWorkTestCase(tests_base.TestCase):
+                           mock.call.destroy_disk_metadata(dev, node_uuid),
+                           mock.call.make_partitions(dev, root_mb, swap_mb,
+                                                     ephemeral_mb,
++                                                    configdrive_mb,
+                                                     commit=True),
+                           mock.call.is_block_device(root_part),
+                           mock.call.is_block_device(swap_part),
+@@ -315,6 +327,7 @@ class PhysicalWorkTestCase(tests_base.TestCase):
+         swap_mb = 64
+         ephemeral_mb = 256
+         ephemeral_format = 'exttest'
++        configdrive_mb = 0
+         node_uuid = "12345678-1234-1234-1234-1234567890abcxyz"
+ 
+         dev = '/dev/fake'
+@@ -343,6 +356,7 @@ class PhysicalWorkTestCase(tests_base.TestCase):
+                           mock.call.is_block_device(dev),
+                           mock.call.make_partitions(dev, root_mb, swap_mb,
+                                                     ephemeral_mb,
++                                                    configdrive_mb,
+                                                     commit=False),
+                           mock.call.is_block_device(root_part),
+                           mock.call.is_block_device(swap_part),
+@@ -362,6 +376,71 @@ class PhysicalWorkTestCase(tests_base.TestCase):
+         self.assertFalse(parent_mock.get_dev_block_size.called)
+         self.assertEqual(root_uuid, returned_root_uuid)
+ 
++    @mock.patch.object(common_utils, 'unlink_without_raise')
++    def test_deploy_with_configdrive(self, mock_unlink):
++        """Check loosely all functions are called with right args."""
++        address = '127.0.0.1'
++        port = 3306
++        iqn = 'iqn.xyz'
++        lun = 1
++        image_path = '/tmp/xyz/image'
++        root_mb = 128
++        swap_mb = 0
++        ephemeral_mb = 0
++        configdrive_mb = 10
++        ephemeral_format = None
++        node_uuid = "12345678-1234-1234-1234-1234567890abcxyz"
++        configdrive_url = 'http://1.2.3.4/cd'
++
++        dev = '/dev/fake'
++        configdrive_part = '/dev/fake-part1'
++        root_part = '/dev/fake-part2'
++        root_uuid = '12345678-1234-1234-12345678-12345678abcdef'
++
++        name_list = ['get_dev', 'get_image_mb', 'discovery', 'login_iscsi',
++                     'logout_iscsi', 'delete_iscsi', 'make_partitions',
++                     'is_block_device', 'populate_image', 'block_uuid',
++                     'notify', 'destroy_disk_metadata', 'dd',
++                     '_get_configdrive']
++        parent_mock = self._mock_calls(name_list)
++        parent_mock.get_dev.return_value = dev
++        parent_mock.get_image_mb.return_value = 1
++        parent_mock.is_block_device.return_value = True
++        parent_mock.block_uuid.return_value = root_uuid
++        parent_mock.make_partitions.return_value = {'root': root_part,
++                                                    'configdrive':
++                                                        configdrive_part}
++        parent_mock._get_configdrive.return_value = (10, 'configdrive-path')
++        calls_expected = [mock.call.get_dev(address, port, iqn, lun),
++                          mock.call.get_image_mb(image_path),
++                          mock.call.discovery(address, port),
++                          mock.call.login_iscsi(address, port, iqn),
++                          mock.call.is_block_device(dev),
++                          mock.call.destroy_disk_metadata(dev, node_uuid),
++                          mock.call._get_configdrive(configdrive_url,
++                                                     node_uuid),
++                          mock.call.make_partitions(dev, root_mb, swap_mb,
++                                                    ephemeral_mb,
++                                                    configdrive_mb,
++                                                    commit=True),
++                          mock.call.is_block_device(root_part),
++                          mock.call.is_block_device(configdrive_part),
++                          mock.call.dd(mock.ANY, configdrive_part),
++                          mock.call.populate_image(image_path, root_part),
++                          mock.call.block_uuid(root_part),
++                          mock.call.logout_iscsi(address, port, iqn),
++                          mock.call.delete_iscsi(address, port, iqn)]
++
++        returned_root_uuid = utils.deploy(address, port, iqn, lun,
++                                          image_path, root_mb, swap_mb,
++                                          ephemeral_mb, ephemeral_format,
++                                          node_uuid,
++                                          configdrive=configdrive_url)
++
++        self.assertEqual(calls_expected, parent_mock.mock_calls)
++        self.assertEqual(root_uuid, returned_root_uuid)
++        mock_unlink.assert_called_once_with('configdrive-path')
++
+     def test_always_logout_and_delete_iscsi(self):
+         """Check if logout_iscsi() and delete_iscsi() are called.
+ 
+@@ -406,7 +485,8 @@ class PhysicalWorkTestCase(tests_base.TestCase):
+                           mock.call.work_on_disk(dev, root_mb, swap_mb,
+                                                  ephemeral_mb,
+                                                  ephemeral_format, image_path,
+-                                                 node_uuid, False),
++                                                 node_uuid, configdrive=None,
++                                                 preserve_ephemeral=False),
+                           mock.call.logout_iscsi(address, port, iqn),
+                           mock.call.delete_iscsi(address, port, iqn)]
+ 
+@@ -497,6 +577,7 @@ class WorkOnDiskTestCase(tests_base.TestCase):
+         self.swap_mb = 64
+         self.ephemeral_mb = 0
+         self.ephemeral_format = None
++        self.configdrive_mb = 0
+         self.dev = '/dev/fake'
+         self.swap_part = '/dev/fake-part1'
+         self.root_part = '/dev/fake-part2'
+@@ -532,7 +613,7 @@ class WorkOnDiskTestCase(tests_base.TestCase):
+         self.assertEqual(self.mock_ibd.call_args_list, calls)
+         self.mock_mp.assert_called_once_with(self.dev, self.root_mb,
+                                              self.swap_mb, self.ephemeral_mb,
+-                                             commit=True)
++                                             self.configdrive_mb, commit=True)
+ 
+     def test_no_swap_partition(self):
+         self.mock_ibd.side_effect = [True, True, False]
+@@ -546,7 +627,7 @@ class WorkOnDiskTestCase(tests_base.TestCase):
+         self.assertEqual(self.mock_ibd.call_args_list, calls)
+         self.mock_mp.assert_called_once_with(self.dev, self.root_mb,
+                                              self.swap_mb, self.ephemeral_mb,
+-                                             commit=True)
++                                             self.configdrive_mb, commit=True)
+ 
+     def test_no_ephemeral_partition(self):
+         ephemeral_part = '/dev/fake-part1'
+@@ -570,7 +651,37 @@ class WorkOnDiskTestCase(tests_base.TestCase):
+         self.assertEqual(self.mock_ibd.call_args_list, calls)
+         self.mock_mp.assert_called_once_with(self.dev, self.root_mb,
+                                              self.swap_mb, ephemeral_mb,
+-                                             commit=True)
++                                             self.configdrive_mb, commit=True)
++
++    @mock.patch.object(common_utils, 'unlink_without_raise')
++    @mock.patch.object(utils, '_get_configdrive')
++    def test_no_configdrive_partition(self, mock_configdrive, mock_unlink):
++        mock_configdrive.return_value = (10, 'fake-path')
++        swap_part = '/dev/fake-part1'
++        configdrive_part = '/dev/fake-part2'
++        root_part = '/dev/fake-part3'
++        configdrive_url = 'http://1.2.3.4/cd'
++        configdrive_mb = 10
++
++        self.mock_mp.return_value = {'swap': swap_part,
++                                     'configdrive': configdrive_part,
++                                     'root': root_part}
++        self.mock_ibd.side_effect = [True, True, True, False]
++        calls = [mock.call(self.dev),
++                 mock.call(root_part),
++                 mock.call(swap_part),
++                 mock.call(configdrive_part)]
++        self.assertRaises(exception.InstanceDeployFailure,
++                          utils.work_on_disk, self.dev, self.root_mb,
++                          self.swap_mb, self.ephemeral_mb,
++                          self.ephemeral_format, self.image_path, 'fake-uuid',
++                          preserve_ephemeral=False,
++                          configdrive=configdrive_url)
++        self.assertEqual(self.mock_ibd.call_args_list, calls)
++        self.mock_mp.assert_called_once_with(self.dev, self.root_mb,
++                                             self.swap_mb, self.ephemeral_mb,
++                                             configdrive_mb, commit=True)
++        mock_unlink.assert_called_once_with('fake-path')
+ 
+ 
+ @mock.patch.object(disk_partitioner, '_list_devfs')
+@@ -583,6 +694,7 @@ class MakePartitionsTestCase(tests_base.TestCase):
+         self.root_mb = 1024
+         self.swap_mb = 512
+         self.ephemeral_mb = 0
++        self.configdrive_mb = 0
+         self.parted_static_cmd = ['parted', '-a', 'optimal', '-s', self.dev,
+                                   '--', 'unit', 'MiB', 'mklabel', 'msdos']
+ 
+@@ -590,7 +702,7 @@ class MakePartitionsTestCase(tests_base.TestCase):
+         mock_list_devfs.return_value = ['/dev/fake1', '/dev/fake2']
+         mock_exc.return_value = (None, None)
+         utils.make_partitions(self.dev, self.root_mb, self.swap_mb,
+-                              self.ephemeral_mb)
++                              self.ephemeral_mb, self.configdrive_mb)
+ 
+         expected_mkpart = ['mkpart', 'primary', 'linux-swap', '1', '513',
+                            'mkpart', 'primary', '', '513', '1537']
+@@ -612,7 +724,7 @@ class MakePartitionsTestCase(tests_base.TestCase):
+         cmd = self.parted_static_cmd + expected_mkpart
+         mock_exc.return_value = (None, None)
+         utils.make_partitions(self.dev, self.root_mb, self.swap_mb,
+-                              self.ephemeral_mb)
++                              self.ephemeral_mb, self.configdrive_mb)
+ 
+         parted_call = mock.call(*cmd, run_as_root=True, check_exit_code=[0])
+         mock_exc.assert_has_calls(parted_call)
+@@ -808,3 +920,56 @@ class RealFilePartitioningTestCase(tests_base.TestCase):
+                           [('uuid', 'path')])
+         mock_clean_up_caches.assert_called_once_with(None, 'master_dir',
+                                                      [('uuid', 'path')])
++
++
++@mock.patch.object(shutil, 'copyfileobj')
++@mock.patch.object(requests, 'get')
++class GetConfigdriveTestCase(tests_base.TestCase):
++
++    @mock.patch.object(gzip, 'GzipFile')
++    def test_get_configdrive(self, mock_gzip, mock_requests, mock_copy):
++        mock_requests.return_value = mock.MagicMock(content='Zm9vYmFy')
++        utils._get_configdrive('http://1.2.3.4/cd', 'fake-node-uuid')
++        mock_requests.assert_called_once_with('http://1.2.3.4/cd')
++        mock_gzip.assert_called_once_with('configdrive', 'rb',
++                                          fileobj=mock.ANY)
++        mock_copy.assert_called_once_with(mock.ANY, mock.ANY)
++
++    @mock.patch.object(gzip, 'GzipFile')
++    def test_get_configdrive_base64_string(self, mock_gzip, mock_requests,
++                                           mock_copy):
++        utils._get_configdrive('Zm9vYmFy', 'fake-node-uuid')
++        self.assertFalse(mock_requests.called)
++        mock_gzip.assert_called_once_with('configdrive', 'rb',
++                                          fileobj=mock.ANY)
++        mock_copy.assert_called_once_with(mock.ANY, mock.ANY)
++
++    def test_get_configdrive_bad_url(self, mock_requests, mock_copy):
++        mock_requests.side_effect = requests.exceptions.RequestException
++        self.assertRaises(exception.InstanceDeployFailure,
++                          utils._get_configdrive, 'http://1.2.3.4/cd',
++                          'fake-node-uuid')
++        self.assertFalse(mock_copy.called)
++
++    @mock.patch.object(base64, 'b64decode')
++    def test_get_configdrive_base64_error(self, mock_b64, mock_requests,
++                                          mock_copy):
++        mock_b64.side_effect = TypeError
++        self.assertRaises(exception.InstanceDeployFailure,
++                          utils._get_configdrive,
++                          'malformed', 'fake-node-uuid')
++        mock_b64.assert_called_once_with('malformed')
++        self.assertFalse(mock_copy.called)
++
++    @mock.patch.object(gzip, 'GzipFile')
++    def test_get_configdrive_gzip_error(self, mock_gzip, mock_requests,
++                                        mock_copy):
++        mock_requests.return_value = mock.MagicMock(content='Zm9vYmFy')
++        mock_copy.side_effect = IOError
++        self.assertRaises(exception.InstanceDeployFailure,
++                          utils._get_configdrive, 'http://1.2.3.4/cd',
++                          'fake-node-uuid')
++        mock_requests.assert_called_once_with('http://1.2.3.4/cd')
++        mock_gzip.assert_called_once_with('configdrive', 'rb',
++                                          fileobj=mock.ANY)
++        mock_copy.assert_called_once_with(mock.ANY, mock.ANY)
+diff --git a/ironic/tests/drivers/test_iscsi_deploy.py b/ironic/tests/drivers/test_iscsi_deploy.py
+index d0ea8ec..01761f2 100644
+--- a/ironic/tests/drivers/test_iscsi_deploy.py
++++ b/ironic/tests/drivers/test_iscsi_deploy.py
+@@ -53,6 +53,7 @@ class IscsiDeployValidateParametersTestCase(db_base.DbTestCase):
+         self.assertIsNotNone(info.get('image_source'))
+         self.assertIsNotNone(info.get('root_gb'))
+         self.assertEqual(0, info.get('ephemeral_gb'))
++        self.assertIsNone(info.get('configdrive'))
+ 
+     def test_parse_instance_info_missing_instance_source(self):
+         # make sure error is raised when info is missing
+@@ -141,6 +142,13 @@ class IscsiDeployValidateParametersTestCase(db_base.DbTestCase):
+                 iscsi_deploy.parse_instance_info,
+                 node)
+ 
++    def test_parse_instance_info_configdrive(self):
++        info = dict(INST_INFO_DICT)
++        info['configdrive'] = 'http://1.2.3.4/cd'
++        node = obj_utils.create_test_node(self.context, instance_info=info)
++        instance_info = iscsi_deploy.parse_instance_info(node)
++        self.assertEqual('http://1.2.3.4/cd', instance_info['configdrive'])
++
+ 
+ class IscsiDeployPrivateMethodsTestCase(db_base.DbTestCase):
+ 
+diff --git a/ironic/tests/test_utils.py b/ironic/tests/test_utils.py
+index 277e5d7..c4ec8ef 100644
+--- a/ironic/tests/test_utils.py
++++ b/ironic/tests/test_utils.py
+@@ -503,3 +503,14 @@ class TempFilesTestCase(base.TestCase):
+ 
+         rmtree_mock.assert_called_once_with(tempdir_created)
+         self.assertTrue(log_mock.error.called)
++
++
++class IsHttpUrlTestCase(base.TestCase):
++
++    def test_is_http_url(self):
++        self.assertTrue(utils.is_http_url('http://127.0.0.1'))
++        self.assertTrue(utils.is_http_url('https://127.0.0.1'))
++        self.assertTrue(utils.is_http_url('HTTP://127.1.2.3'))
++        self.assertTrue(utils.is_http_url('HTTPS://127.3.2.1'))
++        self.assertFalse(utils.is_http_url('Zm9vYmFy'))
++        self.assertFalse(utils.is_http_url('11111111'))

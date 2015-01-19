@@ -1,0 +1,423 @@
+commit 03f0946f360716b6f0e155c3c99aef66e51510f0
+Author: Lucas Alvares Gomes <lucasagomes@gmail.com>
+Date:   Fri Nov 28 11:06:05 2014 +0000
+
+    Extend API multivalue fields
+    
+    This patch is creating a new JsonType type that accepts all the json
+    primitive types: bytes, unicode, float, long, int, dict, list, None
+    and bool.
+    
+    Since the MultiType type is no longer used anywhere in the code it's
+    been deleted.
+    
+    Closes-Bug: #1398350
+    Change-Id: I2d9e4f20419ca2789c2f60034c403d28a5e2b9e8
+    
+    Conflicts:
+    	ironic/api/controllers/v1/chassis.py
+    	ironic/api/controllers/v1/node.py
+    	ironic/api/controllers/v1/port.py
+    	ironic/api/controllers/v1/types.py
+    	ironic/tests/api/v1/test_types.py
+
+diff --git a/ironic/api/controllers/v1/chassis.py b/ironic/api/controllers/v1/chassis.py
+index 9cdc2f2..d3b25f8 100644
+--- a/ironic/api/controllers/v1/chassis.py
++++ b/ironic/api/controllers/v1/chassis.py
+@@ -50,8 +50,8 @@ class Chassis(base.APIBase):
+     description = wtypes.text
+     "The description of the chassis"
+ 
+-    extra = {wtypes.text: types.MultiType(wtypes.text, six.integer_types)}
+-    "The metadata of the chassis"
++    extra = {wtypes.text: types.jsontype}
++    """The metadata of the chassis"""
+ 
+     links = wsme.wsattr([link.Link], readonly=True)
+     "A list containing a self link and associated chassis links"
+diff --git a/ironic/api/controllers/v1/node.py b/ironic/api/controllers/v1/node.py
+index 91041d2..d9a8114 100644
+--- a/ironic/api/controllers/v1/node.py
++++ b/ironic/api/controllers/v1/node.py
+@@ -18,7 +18,6 @@ import datetime
+ from oslo.config import cfg
+ import pecan
+ from pecan import rest
+-import six
+ import wsme
+ from wsme import types as wtypes
+ import wsmeext.pecan as wsme_pecan
+@@ -144,10 +143,9 @@ class ConsoleInfo(base.APIBase):
+     console_enabled = types.boolean
+     "The console state: if the console is enabled or not."
+ 
+-    console_info = {wtypes.text: types.MultiType(wtypes.text,
+-                                                 six.integer_types)}
+-    "The console information. It typically includes the url to access the"
+-    "console and the type of the application that hosts the console."
++    console_info = {wtypes.text: types.jsontype}
++    """The console information. It typically includes the url to access the
++    console and the type of the application that hosts the console."""
+ 
+     @classmethod
+     def sample(cls):
+@@ -402,25 +400,22 @@ class Node(base.APIBase):
+     console_enabled = types.boolean
+     "Indicates whether the console access is enabled or disabled on the node."
+ 
+-    instance_info = {wtypes.text: types.MultiType(wtypes.text,
+-                                                  six.integer_types)}
+-    "This node's instance info."
++    instance_info = {wtypes.text: types.jsontype}
++    """This node's instance info."""
+ 
+     driver = wsme.wsattr(wtypes.text, mandatory=True)
+     "The driver responsible for controlling the node"
+ 
+-    driver_info = {wtypes.text: types.MultiType(wtypes.text,
+-                                                six.integer_types)}
+-    "This node's driver configuration"
++    driver_info = {wtypes.text: types.jsontype}
++    """This node's driver configuration"""
+ 
+-    extra = {wtypes.text: types.MultiType(wtypes.text, six.integer_types)}
+-    "This node's meta data"
++    extra = {wtypes.text: types.jsontype}
++    """This node's meta data"""
+ 
+     # NOTE: properties should use a class to enforce required properties
+     #       current list: arch, cpus, disk, ram, image
+-    properties = {wtypes.text: types.MultiType(wtypes.text,
+-                                               six.integer_types)}
+-    "The physical characteristics of this node"
++    properties = {wtypes.text: types.jsontype}
++    """The physical characteristics of this node"""
+ 
+     chassis_uuid = wsme.wsproperty(types.uuid, _get_chassis_uuid,
+                                    _set_chassis_uuid)
+diff --git a/ironic/api/controllers/v1/port.py b/ironic/api/controllers/v1/port.py
+index 1222adc..926b8bf 100644
+--- a/ironic/api/controllers/v1/port.py
++++ b/ironic/api/controllers/v1/port.py
+@@ -17,7 +17,6 @@ import datetime
+ 
+ import pecan
+ from pecan import rest
+-import six
+ import wsme
+ from wsme import types as wtypes
+ import wsmeext.pecan as wsme_pecan
+@@ -77,8 +76,8 @@ class Port(base.APIBase):
+     address = wsme.wsattr(types.macaddress, mandatory=True)
+     "MAC Address for this port"
+ 
+-    extra = {wtypes.text: types.MultiType(wtypes.text, six.integer_types)}
+-    "This port's meta data"
++    extra = {wtypes.text: types.jsontype}
++    """This port's meta data"""
+ 
+     node_uuid = wsme.wsproperty(types.uuid, _get_node_uuid, _set_node_uuid,
+                                 mandatory=True)
+diff --git a/ironic/api/controllers/v1/types.py b/ironic/api/controllers/v1/types.py
+index 31eb4cb..0852271 100644
+--- a/ironic/api/controllers/v1/types.py
++++ b/ironic/api/controllers/v1/types.py
+@@ -15,7 +15,10 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++import json
++
+ from oslo.utils import strutils
++import six
+ import wsme
+ from wsme import types as wtypes
+ 
+@@ -96,9 +99,41 @@ class BooleanType(wtypes.UserType):
+         return BooleanType.validate(value)
+ 
+ 
++class JsonType(wtypes.UserType):
++    """A simple JSON type."""
++
++    basetype = wtypes.text
++    name = 'json'
++    # FIXME(lucasagomes): When used with wsexpose decorator WSME will try
++    # to get the name of the type by accessing it's __name__ attribute.
++    # Remove this __name__ attribute once it's fixed in WSME.
++    # https://bugs.launchpad.net/wsme/+bug/1265590
++    __name__ = name
++
++    def __str__(self):
++        # These are the json serializable native types
++        return ' | '.join(map(str, (wtypes.text, six.integer_types, float,
++                                    BooleanType, list, dict, None)))
++
++    @staticmethod
++    def validate(value):
++        try:
++            json.dumps(value)
++        except TypeError:
++            raise exception.Invalid(_('%s is not JSON serializable') % value)
++        else:
++            return value
++
++    @staticmethod
++    def frombasetype(value):
++        return JsonType.validate(value)
++
++
+ macaddress = MacAddressType()
+ uuid = UuidType()
+ boolean = BooleanType()
++# Can't call it 'json' because that's the name of the stdlib module
++jsontype = JsonType()
+ 
+ 
+ class JsonPatchType(wtypes.Base):
+@@ -108,7 +143,7 @@ class JsonPatchType(wtypes.Base):
+                          mandatory=True)
+     op = wtypes.wsattr(wtypes.Enum(str, 'add', 'replace', 'remove'),
+                        mandatory=True)
+-    value = wtypes.text
++    value = wsme.wsattr(jsontype, default=wtypes.Unset)
+ 
+     @staticmethod
+     def internal_attrs():
+@@ -141,37 +176,11 @@ class JsonPatchType(wtypes.Base):
+             raise wsme.exc.ClientSideError(msg % patch.path)
+ 
+         if patch.op != 'remove':
+-            if not patch.value:
++            if patch.value is wsme.Unset:
+                 msg = _("'add' and 'replace' operations needs value")
+                 raise wsme.exc.ClientSideError(msg)
+ 
+         ret = {'path': patch.path, 'op': patch.op}
+-        if patch.value:
++        if patch.value is not wsme.Unset:
+             ret['value'] = patch.value
+         return ret
+-
+-
+-class MultiType(wtypes.UserType):
+-    """A complex type that represents one or more types.
+-
+-    Used for validating that a value is an instance of one of the types.
+-
+-    :param *types: Variable-length list of types.
+-
+-    """
+-    def __init__(self, *types):
+-        self.types = types
+-
+-    def __str__(self):
+-        return ' | '.join(map(str, self.types))
+-
+-    def validate(self, value):
+-        for t in self.types:
+-            if t is wsme.types.text and isinstance(value, wsme.types.bytes):
+-                value = value.decode()
+-            if isinstance(value, t):
+-                return value
+-        else:
+-            raise ValueError(
+-                     _("Wrong type. Expected '%(type)s', got '%(value)s'")
+-                     % {'type': self.types, 'value': type(value)})
+diff --git a/ironic/tests/api/v1/test_chassis.py b/ironic/tests/api/v1/test_chassis.py
+index 7dbff49..f0f4718 100644
+--- a/ironic/tests/api/v1/test_chassis.py
++++ b/ironic/tests/api/v1/test_chassis.py
+@@ -338,18 +338,14 @@ class TestPost(base.FunctionalTest):
+         self.assertEqual(403, response.status_int)
+ 
+     def test_create_chassis_valid_extra(self):
+-        cdict = apiutils.chassis_post_data(extra={'foo': 123})
++        cdict = apiutils.chassis_post_data(extra={'str': 'foo', 'int': 123,
++                                                  'float': 0.1, 'bool': True,
++                                                  'list': [1, 2], 'none': None,
++                                                  'dict': {'cat': 'meow'}})
+         self.post_json('/chassis', cdict)
+         result = self.get_json('/chassis/%s' % cdict['uuid'])
+         self.assertEqual(cdict['extra'], result['extra'])
+ 
+-    def test_create_chassis_invalid_extra(self):
+-        cdict = apiutils.chassis_post_data(extra={'foo': 0.123})
+-        response = self.post_json('/chassis', cdict, expect_errors=True)
+-        self.assertEqual(400, response.status_int)
+-        self.assertEqual('application/json', response.content_type)
+-        self.assertTrue(response.json['error_message'])
+-
+     def test_create_chassis_unicode_description(self):
+         descr = u'\u0430\u043c\u043e'
+         cdict = apiutils.chassis_post_data(description=descr)
+diff --git a/ironic/tests/api/v1/test_nodes.py b/ironic/tests/api/v1/test_nodes.py
+index ca9882f..6b2f40f 100644
+--- a/ironic/tests/api/v1/test_nodes.py
++++ b/ironic/tests/api/v1/test_nodes.py
+@@ -790,18 +790,26 @@ class TestPost(base.FunctionalTest):
+             # Check that 'id' is not in first arg of positional args
+             self.assertNotIn('id', cn_mock.call_args[0][0])
+ 
+-    def test_create_node_valid_extra(self):
+-        ndict = post_get_test_node(extra={'foo': 123})
++    def _test_jsontype_attributes(self, attr_name):
++        kwargs = {attr_name: {'str': 'foo', 'int': 123, 'float': 0.1,
++                              'bool': True, 'list': [1, 2], 'none': None,
++                              'dict': {'cat': 'meow'}}}
++        ndict = post_get_test_node(**kwargs)
+         self.post_json('/nodes', ndict)
+         result = self.get_json('/nodes/%s' % ndict['uuid'])
+-        self.assertEqual(ndict['extra'], result['extra'])
++        self.assertEqual(ndict[attr_name], result[attr_name])
+ 
+-    def test_create_node_invalid_extra(self):
+-        ndict = post_get_test_node(extra={'foo': 0.123})
+-        response = self.post_json('/nodes', ndict, expect_errors=True)
+-        self.assertEqual('application/json', response.content_type)
+-        self.assertEqual(400, response.status_code)
+-        self.assertTrue(response.json['error_message'])
++    def test_create_node_valid_extra(self):
++        self._test_jsontype_attributes('extra')
++
++    def test_create_node_valid_properties(self):
++        self._test_jsontype_attributes('properties')
++
++    def test_create_node_valid_driver_info(self):
++        self._test_jsontype_attributes('driver_info')
++
++    def test_create_node_valid_instance_info(self):
++        self._test_jsontype_attributes('instance_info')
+ 
+     def test_vendor_passthru_ok(self):
+         node = obj_utils.create_test_node(self.context)
+diff --git a/ironic/tests/api/v1/test_ports.py b/ironic/tests/api/v1/test_ports.py
+index 3f7bc3f..b2876cc 100644
+--- a/ironic/tests/api/v1/test_ports.py
++++ b/ironic/tests/api/v1/test_ports.py
+@@ -512,18 +512,14 @@ class TestPost(base.FunctionalTest):
+         self.assertTrue(utils.is_uuid_like(result['uuid']))
+ 
+     def test_create_port_valid_extra(self):
+-        pdict = post_get_test_port(extra={'foo': 123})
++        pdict = post_get_test_port(extra={'str': 'foo', 'int': 123,
++                                          'float': 0.1, 'bool': True,
++                                          'list': [1, 2], 'none': None,
++                                          'dict': {'cat': 'meow'}})
+         self.post_json('/ports', pdict)
+         result = self.get_json('/ports/%s' % pdict['uuid'])
+         self.assertEqual(pdict['extra'], result['extra'])
+ 
+-    def test_create_port_invalid_extra(self):
+-        pdict = post_get_test_port(extra={'foo': 0.123})
+-        response = self.post_json('/ports', pdict, expect_errors=True)
+-        self.assertEqual(400, response.status_int)
+-        self.assertEqual('application/json', response.content_type)
+-        self.assertTrue(response.json['error_message'])
+-
+     def test_create_port_no_mandatory_field_address(self):
+         pdict = post_get_test_port()
+         del pdict['address']
+diff --git a/ironic/tests/api/v1/test_types.py b/ironic/tests/api/v1/test_types.py
+index d7963c4..8e6fe9b 100644
+--- a/ironic/tests/api/v1/test_types.py
++++ b/ironic/tests/api/v1/test_types.py
+@@ -16,9 +16,9 @@
+ #    under the License.
+ 
+ import mock
+-import six
+ import webtest
+ import wsme
++from wsme import types as wtypes
+ 
+ from ironic.api.controllers.v1 import types
+ from ironic.common import exception
+@@ -87,7 +87,16 @@ class TestJsonPatchType(base.FunctionalTest):
+     def test_valid_patches(self):
+         valid_patches = [{'path': '/extra/foo', 'op': 'remove'},
+                          {'path': '/extra/foo', 'op': 'add', 'value': 'bar'},
+-                         {'path': '/foo', 'op': 'replace', 'value': 'bar'}]
++                         {'path': '/str', 'op': 'replace', 'value': 'bar'},
++                         {'path': '/bool', 'op': 'add', 'value': True},
++                         {'path': '/int', 'op': 'add', 'value': 1},
++                         {'path': '/float', 'op': 'add', 'value': 0.123},
++                         {'path': '/list', 'op': 'add', 'value': [1, 2]},
++                         {'path': '/none', 'op': 'add', 'value': None},
++                         {'path': '/empty_dict', 'op': 'add', 'value': {}},
++                         {'path': '/empty_list', 'op': 'add', 'value': []},
++                         {'path': '/dict', 'op': 'add',
++                          'value': {'cat': 'meow'}}]
+         ret = self._patch_json(valid_patches, False)
+         self.assertEqual(200, ret.status_int)
+         self.assertEqual(sorted(valid_patches), sorted(ret.json))
+@@ -147,28 +156,7 @@ class TestJsonPatchType(base.FunctionalTest):
+         self.assertTrue(ret.json['faultstring'])
+ 
+ 
+-class TestMultiType(base.FunctionalTest):
+-
+-    def test_valid_values(self):
+-        vt = types.MultiType(wsme.types.text, six.integer_types)
+-        value = vt.validate("hello")
+-        self.assertEqual("hello", value)
+-        value = vt.validate(10)
+-        self.assertEqual(10, value)
+-
+-    def test_invalid_values(self):
+-        vt = types.MultiType(wsme.types.text, six.integer_types)
+-        self.assertRaises(ValueError, vt.validate, 0.10)
+-        self.assertRaises(ValueError, vt.validate, object())
+-
+-    def test_multitype_tostring(self):
+-        vt = types.MultiType(str, int)
+-        vts = str(vt)
+-        self.assertIn(str(str), vts)
+-        self.assertIn(str(int), vts)
+-
+-
+-class TestBooleanType(base.FunctionalTest):
++class TestBooleanType(base.TestCase):
+ 
+     def test_valid_true_values(self):
+         v = types.BooleanType()
+@@ -196,3 +184,38 @@ class TestBooleanType(base.FunctionalTest):
+         v = types.BooleanType()
+         self.assertRaises(exception.Invalid, v.validate, "invalid-value")
+         self.assertRaises(exception.Invalid, v.validate, "01")
++
++
++class TestJsonType(base.TestCase):
++
++    def test_valid_values(self):
++        vt = types.jsontype
++        value = vt.validate("hello")
++        self.assertEqual("hello", value)
++        value = vt.validate(10)
++        self.assertEqual(10, value)
++        value = vt.validate(0.123)
++        self.assertEqual(0.123, value)
++        value = vt.validate(True)
++        self.assertEqual(True, value)
++        value = vt.validate([1, 2, 3])
++        self.assertEqual([1, 2, 3], value)
++        value = vt.validate({'foo': 'bar'})
++        self.assertEqual({'foo': 'bar'}, value)
++        value = vt.validate(None)
++        self.assertEqual(None, value)
++
++    def test_invalid_values(self):
++        vt = types.jsontype
++        self.assertRaises(exception.Invalid, vt.validate, object())
++
++    def test_apimultitype_tostring(self):
++        vts = str(types.jsontype)
++        self.assertIn(str(wtypes.text), vts)
++        self.assertIn(str(int), vts)
++        self.assertIn(str(long), vts)
++        self.assertIn(str(float), vts)
++        self.assertIn(str(types.BooleanType), vts)
++        self.assertIn(str(list), vts)
++        self.assertIn(str(dict), vts)
++        self.assertIn(str(None), vts)

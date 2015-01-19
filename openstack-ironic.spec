@@ -11,7 +11,7 @@
 Name:		openstack-ironic
 Summary:	OpenStack Baremetal Hypervisor API (ironic)
 Version:	2014.2
-Release:	3%{?dist}
+Release:	3.1.patched%{?dist}
 License:	ASL 2.0
 Group:		System Environment/Base
 URL:		http://www.openstack.org
@@ -25,6 +25,11 @@ Source3:	ironic-rootwrap-sudoers
 Patch0001: 0001-Remove-pbr-dependency.patch
 Patch0002: 0002-Set-default-DB-location.patch
 Patch0003: 0003-Remove-runtime-pbr-requirement-from-version.py.patch
+Patch0004: 0004-Call-partprobe-after-partioning-the-disk.patch
+Patch0005: 0005-Extend-API-multivalue-fields.patch
+Patch0006: 0006-Pass-root-device-hints-via-kernel-cmdline.patch
+Patch0007: 0007-Add-configdrive-support.patch
+Patch0008: 0008-Add-support-for-local-boot.patch
 
 BuildArch:	noarch
 BuildRequires:	python-setuptools
@@ -44,6 +49,11 @@ BuildRequires:	systemd
 %patch0001 -p1
 %patch0002 -p1
 %patch0003 -p1
+%patch0004 -p1
+%patch0005 -p1
+%patch0006 -p1
+%patch0007 -p1
+%patch0008 -p1
 
 rm requirements.txt test-requirements.txt
 
